@@ -13,4 +13,9 @@ Data Requirements - The Pipeline leverages 2 key datasets :
 * SNOMED Graph Ontology
 * Annotated Clinical Notes from MIMIC IV dataset
 
+Training CER Model - train_cer.py
+Training Linker Model - train_linker.py
+Inference Pipeline - main.py
+
+
  
