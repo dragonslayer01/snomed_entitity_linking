@@ -178,114 +178,148 @@ def train_cer_model():
   """
 
   
-random_seed = 42  # For reproducibility
-max_seq_len = 512  # Maximum sequence length for (BERT-based) encoders
-cer_model_id = "microsoft/deberta-v3-large"  # Base model for Clinical Entity Recogniser
-kb_embedding_model_id = ("sentence-transformers/all-MiniLM-L6-v2") # base model for concept encoder
-use_LoRA = False  # Whether to use a LoRA to fine-tune the CER model
+    random_seed = 42  # For reproducibility
+    max_seq_len = 512  # Maximum sequence length for (BERT-based) encoders
+    cer_model_id = "microsoft/deberta-v3-large"  # Base model for Clinical Entity Recogniser
+    kb_embedding_model_id = ("sentence-transformers/all-MiniLM-L6-v2") # base model for concept encoder
+    use_LoRA = False  # Whether to use a LoRA to fine-tune the CER model
+    
+    
+    torch.manual_seed(random_seed)
+    assert torch.cuda.is_available()
+    
+    
+    notes_df = pd.read_csv("data/training_notes.csv").set_index("note_id")
+    print(f"{notes_df.shape[0]} notes loaded.")
+    
+    
+    annotations_df = pd.read_csv("data/training_annotations.csv").set_index("note_id")
+    print(f"{annotations_df.shape[0]} annotations loaded.")
+    print(f"{annotations_df.concept_id.nunique()} unique concepts seen.")
+    print(f"{annotations_df.index.nunique()} unique notes seen.")
+    
+    
+    training_notes_df, test_notes_df = train_test_split(
+        notes_df, test_size=32, random_state=random_seed
+    )
+    training_annotations_df = annotations_df.loc[training_notes_df.index]
+    test_annotations_df = annotations_df.loc[test_notes_df.index]
+    
+    print(
+        f"There are {training_annotations_df.shape[0]} total annotations in the training set."
+    )
+    print(f"There are {test_annotations_df.shape[0]} total annotations in the test set.")
+    print(
+        f"There are {training_annotations_df.concept_id.nunique()} distinct concepts in the training set."
+    )
+    print(
+        f"There are {test_annotations_df.concept_id.nunique()} distinct concepts in the test set."
+    )
+    print(f"There are {training_notes_df.shape[0]} notes in the training set.")
+    print(f"There are {test_notes_df.shape[0]} notes in the test set.")
+    
+    
+    label2id = {"O": 0, "B-clinical_entity": 1, "I-clinical_entity": 2}
+    
+    id2label = {v: k for k, v in label2id.items()}
+    
+    cer_tokenizer = AutoTokenizer.from_pretrained(
+        cer_model_id, model_max_length=max_seq_len
+    )
+    
+    # We can ignore the "Token indices sequence length is longer than the specified maximum sequence length"
+    # warning because we are chunking by hand.
+    train = pd.DataFrame(
+        list(generate_ner_dataset(training_notes_df, training_annotations_df))
+    )
+    train = Dataset.from_pandas(train)
+    
+    test = pd.DataFrame(list(generate_ner_dataset(test_notes_df, test_annotations_df)))
+    test = Dataset.from_pandas(test)
+    
+    # The data collator handles batching for us.
+    data_collator = DataCollatorForTokenClassification(tokenizer=cer_tokenizer)
+    
+    seqeval = evaluate.load("seqeval")
+    
+    cer_model = DebertaV2ForTokenClassification.from_pretrained(
+        cer_model_id, num_labels=3, id2label=id2label, label2id=label2id
+    )
+    
+    if use_LoRA:
+        lora_config = LoraConfig(
+            lora_alpha=8,
+            lora_dropout=0.1,
+            r=8,
+            bias="none",
+            task_type="TOKEN_CLS",
+        )
+    
+        cer_model = get_peft_model(cer_model, lora_config)
+    
+        cer_model.print_trainable_parameters()
+    
+    training_args = TrainingArguments(
+        output_dir="~/temp/cer_model",
+        learning_rate=2e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=5,
+        weight_decay=0.01,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=10,
+        load_best_model_at_end=True,
+        fp16=False,
+        seed=random_seed,
+    )
+    
+    trainer = Trainer(
+        model=cer_model,
+        args=training_args,
+        train_dataset=train,
+        eval_dataset=test,
+        tokenizer=cer_tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+    
+    trainer.train()
+    
+    trainer.save_model("cer_model")
+    cer_tokenizer.save_pretrained("cer_model")
 
+def infer_cer(use_LoRA = True,model_path = "cer_model"):
+    """
+    Infer Pipeline for trained CER Model
+    """
+    if use_LoRA:
+        config = PeftConfig.from_pretrained(model_path)
+    
+        cer_model = DebertaV2ForTokenClassification.from_pretrained(
+            pretrained_model_name_or_path=config.base_model_name_or_path,
+            num_labels=3,
+            id2label=id2label,
+            label2id=label2id,
+        )
+        cer_model = PeftModel.from_pretrained(cer_model, "cer_model")
+    else:
+        cer_model = DebertaV2ForTokenClassification.from_pretrained(
+            pretrained_model_name_or_path=model_path,
+            num_labels=3,
+            id2label=id2label,
+            label2id=label2id,
+        )
 
-torch.manual_seed(random_seed)
-assert torch.cuda.is_available()
-
-
-notes_df = pd.read_csv("data/training_notes.csv").set_index("note_id")
-print(f"{notes_df.shape[0]} notes loaded.")
-
-
-annotations_df = pd.read_csv("data/training_annotations.csv").set_index("note_id")
-print(f"{annotations_df.shape[0]} annotations loaded.")
-print(f"{annotations_df.concept_id.nunique()} unique concepts seen.")
-print(f"{annotations_df.index.nunique()} unique notes seen.")
-
-
-training_notes_df, test_notes_df = train_test_split(
-    notes_df, test_size=32, random_state=random_seed
-)
-training_annotations_df = annotations_df.loc[training_notes_df.index]
-test_annotations_df = annotations_df.loc[test_notes_df.index]
-
-print(
-    f"There are {training_annotations_df.shape[0]} total annotations in the training set."
-)
-print(f"There are {test_annotations_df.shape[0]} total annotations in the test set.")
-print(
-    f"There are {training_annotations_df.concept_id.nunique()} distinct concepts in the training set."
-)
-print(
-    f"There are {test_annotations_df.concept_id.nunique()} distinct concepts in the test set."
-)
-print(f"There are {training_notes_df.shape[0]} notes in the training set.")
-print(f"There are {test_notes_df.shape[0]} notes in the test set.")
-
-
-label2id = {"O": 0, "B-clinical_entity": 1, "I-clinical_entity": 2}
-
-id2label = {v: k for k, v in label2id.items()}
-
-cer_tokenizer = AutoTokenizer.from_pretrained(
-    cer_model_id, model_max_length=max_seq_len
-)
-
-# We can ignore the "Token indices sequence length is longer than the specified maximum sequence length"
-# warning because we are chunking by hand.
-train = pd.DataFrame(
-    list(generate_ner_dataset(training_notes_df, training_annotations_df))
-)
-train = Dataset.from_pandas(train)
-
-test = pd.DataFrame(list(generate_ner_dataset(test_notes_df, test_annotations_df)))
-test = Dataset.from_pandas(test)
-
-# The data collator handles batching for us.
-data_collator = DataCollatorForTokenClassification(tokenizer=cer_tokenizer)
-
-seqeval = evaluate.load("seqeval")
-
-cer_model = DebertaV2ForTokenClassification.from_pretrained(
-    cer_model_id, num_labels=3, id2label=id2label, label2id=label2id
-)
-
-if use_LoRA:
-    lora_config = LoraConfig(
-        lora_alpha=8,
-        lora_dropout=0.1,
-        r=8,
-        bias="none",
-        task_type="TOKEN_CLS",
+    cer_pipeline = pipeline(
+    task="token-classification",
+    model=cer_model,
+    tokenizer=cer_tokenizer,
+    aggregation_strategy="first",
+    device="cpu",
     )
 
-    cer_model = get_peft_model(cer_model, lora_config)
+    return cer_pipeline
 
-    cer_model.print_trainable_parameters()
 
-training_args = TrainingArguments(
-    output_dir="~/temp/cer_model",
-    learning_rate=2e-5,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    num_train_epochs=5,
-    weight_decay=0.01,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=10,
-    load_best_model_at_end=True,
-    fp16=False,
-    seed=random_seed,
-)
-
-trainer = Trainer(
-    model=cer_model,
-    args=training_args,
-    train_dataset=train,
-    eval_dataset=test,
-    tokenizer=cer_tokenizer,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-)
-
-trainer.train()
-
-trainer.save_model("cer_model")
-cer_tokenizer.save_pretrained("cer_model")
 
